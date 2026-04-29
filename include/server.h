@@ -89,6 +89,10 @@ struct nvnc {
 		uint32_t hotspot_x, hotspot_y;
 	} cursor;
 	uint32_t cursor_seq;
+	struct {
+		uint16_t x, y;
+	} cursor_pos;
+	uint32_t cursor_pos_seq;
 
 	enum nvnc_auth_flags auth_flags;
 	nvnc_auth_fn auth_fn;

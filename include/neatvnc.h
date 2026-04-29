@@ -792,6 +792,15 @@ void nvnc_set_cursor(struct nvnc*, struct nvnc_frame*, uint16_t hotspot_x,
 		uint16_t hotspot_y, bool is_damaged);
 
 /**
+ * Set the server-side cursor position. Clients that have requested the
+ * Cursor-Position pseudo-encoding receive this position so they can render
+ * the cursor where the server actually has it (rather than at the local
+ * mouse position). Useful when the cursor moves on the server independently
+ * of client input.
+ */
+void nvnc_set_cursor_position(struct nvnc*, uint16_t x, uint16_t y);
+
+/**
  * Default log handler that prints to stderr with file and line info.
  */
 void nvnc_default_logger(const struct nvnc_log_data* meta, const char* message);

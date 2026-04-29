@@ -36,6 +36,7 @@
 #include "transform-util.h"
 #include "type-macros.h"
 #include "server.h"
+#include "compat/socket-io.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -851,6 +852,7 @@ static int on_client_set_encodings(struct nvnc_client* client)
 		case RFB_ENCODING_ZRLE:
 		case RFB_ENCODING_OPEN_H264:
 		case RFB_ENCODING_CURSOR:
+		case RFB_ENCODING_CURSOR_POS:
 		case RFB_ENCODING_DESKTOPSIZE:
 		case RFB_ENCODING_DESKTOPNAME:
 		case RFB_ENCODING_EXTENDEDDESKTOPSIZE:
@@ -858,7 +860,9 @@ static int on_client_set_encodings(struct nvnc_client* client)
 		case RFB_ENCODING_QEMU_LED_STATE:
 		case RFB_ENCODING_VMWARE_LED_STATE:
 		case RFB_ENCODING_EXTENDED_CLIPBOARD:
+#ifndef WINVNC_DISABLE_CONTINUOUS_UPDATES
 		case RFB_ENCODING_CONTINUOUSUPDATES:
+#endif
 		case RFB_ENCODING_EXT_MOUSE_BUTTONS:
 		case RFB_ENCODING_FENCE:
 #ifdef ENABLE_EXPERIMENTAL
@@ -931,6 +935,32 @@ static void send_cursor_update(struct nvnc_client* client)
 			NULL, NULL);
 }
 
+/* Send a Cursor-Position pseudo-encoding rect telling the client where the
+ * server-side cursor is. Width/height are 0 — only the (x, y) of the rect
+ * header carries the cursor position. */
+static void send_cursor_position_update(struct nvnc_client* client)
+{
+	struct nvnc* server = client->server;
+
+	struct rfb_server_fb_update_msg head = {
+		.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
+		.n_rects = htons(1),
+	};
+
+	struct rfb_server_fb_rect rect = {
+		.encoding = htonl(RFB_ENCODING_CURSOR_POS),
+		.x = htons(server->cursor_pos.x),
+		.y = htons(server->cursor_pos.y),
+		.width = 0,
+		.height = 0,
+	};
+
+	stream_write(client->net_stream, &head, sizeof(head));
+	stream_write(client->net_stream, &rect, sizeof(rect));
+
+	client->cursor_pos_seq = server->cursor_pos_seq;
+}
+
 static void send_desktop_name_update(struct nvnc_client* client)
 {
 	struct nvnc* server = client->server;
@@ -986,6 +1016,7 @@ static const char* encoding_to_string(enum rfb_encodings encoding)
 	case RFB_ENCODING_ZRLE: return "zrle";
 	case RFB_ENCODING_OPEN_H264: return "open-h264";
 	case RFB_ENCODING_CURSOR: return "cursor";
+	case RFB_ENCODING_CURSOR_POS: return "cursor-position";
 	case RFB_ENCODING_DESKTOPSIZE: return "desktop-size";
 	case RFB_ENCODING_DESKTOPNAME: return "desktop-name";
 	case RFB_ENCODING_EXTENDEDDESKTOPSIZE: return "extended-desktop-size";
@@ -1169,6 +1200,18 @@ static void process_fb_update_requests(struct nvnc_client* client)
 
 		if (decrement_pending_requests(client) <= 0)
 			return;
+	}
+
+	if (server->cursor_pos_seq != client->cursor_pos_seq
+			&& client_has_encoding(client, RFB_ENCODING_CURSOR_POS)) {
+		send_cursor_position_update(client);
+
+		if (decrement_pending_requests(client) <= 0)
+			return;
+	} else {
+		/* Client doesn't want position updates; keep our seq aligned
+		 * so we don't re-evaluate this branch every frame. */
+		client->cursor_pos_seq = server->cursor_pos_seq;
 	}
 
 	if (client->needs_desktop_name_update) {
@@ -2375,6 +2418,61 @@ static void on_handshake_timeout(struct aml_timer* timer)
 	client_close(client);
 }
 
+/* Inject a pre-connected socket fd as a new VNC client.
+ * Used in stdio/embedded mode where there is no listen socket.
+ */
+int nvnc_inject_fd(struct nvnc* server, int fd)
+{
+	struct nvnc_client* client = calloc(1, sizeof(*client));
+	if (!client)
+		return -1;
+
+	weakref_subject_init(&client->weakref);
+
+	client->server = server;
+	client->quality = 10;
+	client->led_state = -1;
+	client->min_rtt = INT32_MAX;
+	client->bwe = bwe_create(INT32_MAX);
+	client->compositor = compositor_create();
+
+	client->ext_clipboard_caps =
+		RFB_EXT_CLIPBOARD_FORMAT_TEXT |
+		RFB_EXT_CLIPBOARD_ACTION_REQUEST |
+		RFB_EXT_CLIPBOARD_ACTION_NOTIFY |
+		RFB_EXT_CLIPBOARD_ACTION_PROVIDE;
+	client->ext_clipboard_max_unsolicited_text_size =
+		MAX_CLIENT_UNSOLICITED_TEXT_SIZE;
+
+	int one = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+	client->net_stream = stream_new(fd, on_client_event, client);
+	if (!client->net_stream) {
+		free(client);
+		return -1;
+	}
+
+	pixman_region_init(&client->damage);
+
+	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION_MESSAGE);
+	if (!payload) {
+		pixman_region_fini(&client->damage);
+		stream_destroy(client->net_stream);
+		free(client);
+		return -1;
+	}
+
+	client->last_ping_time = gettime_us(CLOCK_MONOTONIC);
+	stream_send(client->net_stream, payload, NULL, NULL);
+
+	LIST_INSERT_HEAD(&server->clients, client, link);
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
+
+	nvnc_log(NVNC_LOG_INFO, "Injected client from fd %d: %p", fd, client);
+	return 0;
+}
+
 static void on_connection(struct aml_handler* poll_handle)
 {
 	struct nvnc__socket* socket = aml_get_userdata(poll_handle);
@@ -2467,7 +2565,7 @@ payload_failure:
 buffer_failure:
 	stream_destroy(client->net_stream);
 stream_failure:
-	close(fd);
+	socket_close(fd);
 accept_failure:
 	free(client);
 }
@@ -2539,7 +2637,7 @@ static int bind_address_tcp(const char* name, int port)
 
 		nvnc_log(NVNC_LOG_DEBUG, "Failed to bind to address: %m");
 failure:
-		close(fd);
+		socket_close(fd);
 		fd = -1;
 	}
 
@@ -2564,7 +2662,7 @@ static int bind_address_unix(const char* name)
 		return -1;
 
 	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-		close(fd);
+		socket_close(fd);
 		return -1;
 	}
 
@@ -2636,7 +2734,7 @@ int nvnc_listen_tcp(struct nvnc* self, const char* addr, uint16_t port,
 
 	struct nvnc__socket* socket = nvnc__listen(self, fd, type);
 	if (!socket) {
-		close(fd);
+		socket_close(fd);
 		return -1;
 	}
 
@@ -2663,7 +2761,7 @@ failure:
 	if (type == NVNC_STREAM_WEBSOCKET) {
 		unlink(path);
 	}
-	close(fd);
+	socket_close(fd);
 
 	return -1;
 }
@@ -2717,7 +2815,7 @@ void nvnc_del(struct nvnc* self)
 		if (!socket->is_external) {
 			unlink_fd_path(socket->fd);
 		}
-		close(socket->fd);
+		socket_close(socket->fd);
 
 		free(socket);
 	}
@@ -3391,6 +3489,21 @@ void nvnc_set_cursor(struct nvnc* self, struct nvnc_frame* fb, uint16_t hotspot_
 		return;
 
 	self->cursor_seq++;
+
+	struct nvnc_client* client;
+	LIST_FOREACH(client, &self->clients, link)
+		process_fb_update_requests(client);
+}
+
+EXPORT
+void nvnc_set_cursor_position(struct nvnc* self, uint16_t x, uint16_t y)
+{
+	if (self->cursor_pos.x == x && self->cursor_pos.y == y)
+		return;
+
+	self->cursor_pos.x = x;
+	self->cursor_pos.y = y;
+	self->cursor_pos_seq++;
 
 	struct nvnc_client* client;
 	LIST_FOREACH(client, &self->clients, link)

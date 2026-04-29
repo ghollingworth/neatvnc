@@ -33,6 +33,7 @@
 #include "stream/tcp.h"
 #include "sys/queue.h"
 #include "neatvnc.h"
+#include "compat/socket-io.h"
 
 static_assert(sizeof(struct stream) <= STREAM_ALLOC_SIZE,
 		"struct stream has grown too large, increase STREAM_ALLOC_SIZE");
@@ -54,7 +55,7 @@ int stream_tcp_close(struct stream* self)
 	}
 
 	aml_stop(aml_get_default(), self->handler);
-	close(self->fd);
+	socket_close(self->fd);
 	self->fd = -1;
 
 	// unref
@@ -222,7 +223,7 @@ ssize_t stream_tcp_read(struct stream* self, void* dst, size_t size)
 		read_buffer = self->tmp_buf.data;
 	}
 
-	ssize_t rc = read(self->fd, read_buffer, size);
+	ssize_t rc = socket_read(self->fd, read_buffer, size);
 	if (rc == 0)
 		stream__remote_closed(self);
 	if (rc > 0)

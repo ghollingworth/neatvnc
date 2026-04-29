@@ -100,6 +100,7 @@ struct nvnc_client {
 	struct encoder* tight_encoder;
 	struct compositor* compositor;
 	uint32_t cursor_seq;
+	uint32_t cursor_pos_seq;
 	int quality;
 	bool formats_changed;
 	enum nvnc_keyboard_led_state led_state;
@@ -136,4 +137,3 @@ struct nvnc_client {
 };
 
 LIST_HEAD(nvnc_client_list, nvnc_client);
-
