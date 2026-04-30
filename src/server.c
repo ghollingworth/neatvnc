@@ -1994,7 +1994,13 @@ static enum rfb_resize_status check_desktop_layout(struct nvnc_client* client,
 		return RFB_RESIZE_STATUS_PROHIBITED;
 	}
 
-	return RFB_RESIZE_STATUS_REQUEST_FORWARDED;
+	/* Reply SUCCESS (status 0). Upstream returns REQUEST_FORWARDED (4)
+	 * for backends that handle resizes asynchronously, but RFB only
+	 * standardises statuses 0–3 — noVNC decodes 4 as "Unknown reason".
+	 * winvnc applies the resize synchronously inside the callback
+	 * (nvnc_display_set_logical_size), so SUCCESS is the correct,
+	 * spec-compliant reply. */
+	return RFB_RESIZE_STATUS_SUCCESS;
 }
 
 static const char* resize_status_string(enum rfb_resize_status status)
